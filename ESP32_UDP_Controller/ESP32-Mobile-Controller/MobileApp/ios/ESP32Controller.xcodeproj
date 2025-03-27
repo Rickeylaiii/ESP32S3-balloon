@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE xcodeproj>
+<xcodeproj>
+    <objectVersion>46</objectVersion>
+    <objects>
+        <group>
+            <name>ESP32Controller</name>
+            <children>
+                <fileRef>AppDelegate.swift</fileRef>
+                <fileRef>ViewController.swift</fileRef>
+                <fileRef>UdpManager.swift</fileRef>
+                <fileRef>Info.plist</fileRef>
+            </children>
+        </group>
+    </objects>
+</xcodeproj>

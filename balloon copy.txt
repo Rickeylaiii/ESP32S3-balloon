@@ -1,0 +1,1500 @@
+#include <WiFi.h>
+#include <ESPAsyncWebServer.h>
+#include <Preferences.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <MS5611.h>  // Add MS5611 library
+#include "pid.h"     // Add PID controller header file
+
+// PID altitude control related variables
+PidController altitudeController(20.0, 0.1, 5.0, 50); // Kp, Ki, Kd, update interval
+
+// WiFi credentials
+const char* ssid = "Mi10S";     // CHANGE THIS
+const char* password = "12345678";  // CHANGE THIS
+
+// MS5611 sensor variables
+int tempReadCounter = 0;
+#define TEMP_READ_INTERVAL 100  // 每10次压力读取才读一次温度
+
+MS5611 ms5611(0x77);  // Create MS5611 object, default address 0x77
+float temperature = 0;  // Temperature in °C
+float pressure = 0;     // Pressure in mBar
+float altitude = 0;     // Altitude in meters
+unsigned long lastSensorReadTime = 0;  // Last sensor read time
+const unsigned long sensorReadInterval = 10;  // Read interval in milliseconds
+bool readingTemp = true;  // For alternately reading temperature and pressure
+
+// Add to the global variables section
+// Altitude filter related variables
+#define ALTITUDE_FILTER_SIZE 10  // Filter window size
+float altitudeBuffer[ALTITUDE_FILTER_SIZE]; // Store recent altitude data
+int altitudeBufferIndex = 0;    // Current buffer index
+float filteredAltitude = 0;     // Filtered altitude
+bool altitudeBufferFilled = false; // Whether buffer is filled
+
+// Add to global variables section
+// AP mode configuration
+#define AP_SSID "ESP32-Motor-AP"
+#define AP_PASSWORD "12345678"
+#define CONFIG_PORTAL_TIMEOUT 180   // AP mode timeout in seconds
+bool apMode = false;                // Whether in AP mode
+unsigned long apStartTime = 0;      // AP mode start time
+const byte DNS_PORT = 53;           // DNS server port
+DNSServer dnsServer;                // DNS server object for capturing all DNS requests
+Preferences preferences;            // For saving WiFi settings
+
+// Add WiFi status tracking variables to global variables section
+bool lastWifiConnected = false;
+int reconnectAttempts = 0;
+const int maxReconnectAttempts = 10;
+unsigned long lastReconnectTime = 0;
+const unsigned long reconnectInterval = 5000; // 5 seconds
+
+// Motor pin definitions
+const int motor1_in1 = 5;  // Motor 1 input 1
+const int motor1_in2 = 6;  // Motor 1 input 2
+const int motor2_in1 = 7;  // Motor 2 input 1
+const int motor2_in2 = 15; // Motor 2 input 2
+const int motor3_in1 = 16; // Motor 3 input 1
+const int motor3_in2 = 17; // Motor 3 input 2
+
+// LEDC PWM configuration
+#define PWM_FREQUENCY 15000  // 15KHz
+#define PWM_RESOLUTION 10    // 10-bit resolution (0-1023)
+
+// PWM channel assignments
+#define MOTOR1_IN1_CHANNEL 0
+#define MOTOR1_IN2_CHANNEL 1
+#define MOTOR2_IN1_CHANNEL 2
+#define MOTOR2_IN2_CHANNEL 3
+#define MOTOR3_IN1_CHANNEL 4
+#define MOTOR3_IN2_CHANNEL 5
+
+// Create AsyncWebServer object on port 80
+AsyncWebServer server(80);
+
+// HTML webpage
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
+<head>
+  <title>ESP32 Motor Control</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html {font-family: Arial; display: inline-block; text-align: center;}
+    h2 {font-size: 2.3rem;}
+    p {font-size: 1.9rem;}
+    body {max-width: 600px; margin:0px auto; padding-bottom: 25px;}
+    .slider {width: 300px; height: 50px;}
+    .button {background-color: #f44336; border: none; color: white; padding: 15px 32px; 
+             text-align: center; font-size: 16px; margin: 4px 2px; cursor: pointer;}
+    #joystick-container {
+      position: relative;
+      width: 300px;
+      height: 300px;
+      background: #f0f0f0;
+      border: 2px solid #999;
+      border-radius: 50%;
+      margin: 0 auto;
+      touch-action: none;
+    }
+    #joystick-thumb {
+      position: absolute;
+      width: 80px;
+      height: 80px;
+      background: #3498db;
+      border-radius: 50%;
+      top: 110px;
+      left: 110px;
+      cursor: pointer;
+      user-select: none;
+    }
+    .motor-value {
+      font-size: 1.5rem;
+      margin: 10px;
+    }
+    .slider-container {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin: 10px auto;
+    }
+    .slider-value {
+      font-size: 1.5rem;
+      margin-left: 15px;
+      min-width: 60px;
+    }
+    .control-container {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      margin: 20px auto;
+      gap: 30px; /* spacing between joystick and slider */
+    }
+    
+    .joystick-motor-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    
+    .vertical-slider-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      height: 300px;
+      justify-content: center;
+    }
+    
+    .vertical-slider {
+      -webkit-appearance: slider-vertical;
+      width: 50px;
+      height: 250px;
+      margin: 10px 0;
+    }
+    
+    /* Firefox specific styles */
+    @supports (-moz-appearance:none) {
+      .vertical-slider {
+        writing-mode: bt-lr; /* IE */
+        -webkit-appearance: slider-vertical; /* WebKit */
+        width: 50px;
+        height: 250px;
+      }
+    }
+  </style>
+</head>
+<body>
+  <h2>ESP32 Motor Control</h2>
+  
+  <div class="control-container">
+    <div class="joystick-motor-container">
+      <p>Left Motor & Right Motor</p>
+      <div id="joystick-container">
+        <div id="joystick-thumb"></div>
+      </div>
+      <div class="motor-value">
+        Left Motor: <span id="motor1Value">0</span>%
+      </div>
+      <div class="motor-value">
+        Right Motor: <span id="motor2Value">0</span>%
+      </div>
+    </div>
+    
+    <!-- Motor status indicator in vertical slider container -->
+    <div class="vertical-slider-container">
+      <p>Motor 3</p>
+      <div id="motor3-control-indicator" style="font-size: 0.8rem; margin-bottom: 5px; height: 20px;">Manual Control</div>
+      <input type="range" min="-100" max="100" value="0" class="vertical-slider" id="motor3Slider" 
+             orient="vertical" oninput="document.getElementById('motor3Value').innerHTML = this.value;" 
+             onchange="updateMotor(3, this.value);">
+      <div class="slider-value"><span id="motor3Value">0</span>%</div>
+    </div>
+  </div>
+  
+  <button class="button" onclick="stopAllMotors()">STOP ALL MOTORS</button>
+
+  <!-- Add sensor data display area -->
+  <div style="margin-top: 20px; border: 1px solid #ddd; border-radius: 10px; padding: 15px; background-color: #f9f9f9;">
+    <h3 style="margin-top: 0;">Sensor Data</h3>
+    <div style="display: flex; flex-wrap: wrap; justify-content: center;">
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #2196F3;">Temperature</div>
+        <div style="font-size: 1.4rem;"><span id="temperature">--</span>C</div>
+      </div>
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #4CAF50;">Pressure</div>
+        <div style="font-size: 1.4rem;"><span id="pressure">--</span> hPa</div>
+      </div>
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #FF9800;">Altitude</div>
+        <div style="font-size: 1.4rem;"><span id="altitude">--</span> m</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Altitude control UI after sensor data section -->
+  <div style="margin-top: 20px; border: 1px solid #ddd; border-radius: 10px; padding: 15px; background-color: #f9f9f9;">
+    <h3 style="margin-top: 0;">Altitude Control</h3>
+    
+    <div style="display: flex; flex-wrap: wrap; justify-content: center; margin-bottom: 15px;">
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #2196F3;">Initial Altitude</div>
+        <div style="font-size: 1.2rem;"><span id="initialAltitude">--</span> m</div>
+      </div>
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #4CAF50;">Relative Altitude</div>
+        <div style="font-size: 1.2rem;"><span id="relativeAltitude">--</span> m</div>
+      </div>
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #FF9800;">Target Altitude</div>
+        <div style="font-size: 1.2rem;"><span id="targetAltitudeDisplay">--</span> m</div>
+      </div>
+    </div>
+    
+    <div style="margin: 15px 0;">
+      <button onclick="calibrateAltitude()" style="background-color: #2196F3; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; margin: 0 5px;">Calibrate Initial Altitude</button>
+      <button onclick="toggleAutoAltitude()" id="autoControlButton" style="background-color: #FF9800; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer; margin: 0 5px;">Enable Auto Control</button>
+    </div>
+    
+    <div style="margin: 15px 0; display: flex; justify-content: center; align-items: center;">
+      <label style="margin-right: 10px;">Set Target Altitude:</label>
+      <input type="number" id="targetAltitude" step="0.01" style="width: 80px; padding: 8px;" value="0">
+      <span style="margin: 0 5px;">m</span>
+      <button onclick="setTargetAltitude()" style="background-color: #4CAF50; color: white; border: none; padding: 8px 15px; border-radius: 5px; margin-left: 10px; cursor: pointer;">Set</button>
+    </div>
+  </div>
+
+  <!-- PID parameter adjustment interface after altitude control UI -->
+  <div style="margin-top: 20px; border: 1px solid #ddd; border-radius: 10px; padding: 15px; background-color: #f9f9f9;">
+    <h3 style="margin-top: 0;">PID Parameter Adjustment</h3>
+    
+    <div style="display: flex; flex-wrap: wrap; justify-content: center; margin-bottom: 15px;">
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #2196F3;">Kp</div>
+        <input type="number" id="kp" step="0.01" min="0" style="width: 80px; padding: 8px;" value="20.0">
+      </div>
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #4CAF50;">Ki</div>
+        <input type="number" id="ki" step="0.001" min="0" style="width: 80px; padding: 8px;" value="0.1">
+      </div>
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #FF9800;">Kd</div>
+        <input type="number" id="kd" step="0.01" min="0" style="width: 80px; padding: 8px;" value="5.0">
+      </div>
+    </div>
+    
+    <div style="text-align: center; margin: 15px 0;">
+      <button onclick="updatePidParams()" style="background-color: #4CAF50; color: white; border: none; padding: 10px 15px; border-radius: 5px; cursor: pointer;">Update PID Parameters</button>
+    </div>
+  </div>
+
+  <script>
+    // Joystick control
+    const container = document.getElementById('joystick-container');
+    const thumb = document.getElementById('joystick-thumb');
+    let isDragging = false;
+    let centerX, centerY, maxRadius;
+    let currentX = 0;
+    let currentY = 0;
+    
+    // Initialize joystick parameters
+    function initJoystick() {
+      const rect = container.getBoundingClientRect();
+      centerX = rect.width / 2;
+      centerY = rect.height / 2;
+      maxRadius = Math.min(centerX, centerY) - 40; // Subtract joystick radius to prevent overflow
+    }
+    
+    // Update joystick position and motor values
+    function updateJoystickPosition(clientX, clientY) {
+      const rect = container.getBoundingClientRect();
+      let dx = clientX - rect.left - centerX;
+      let dy = clientY - rect.top - centerY;
+      
+      // Calculate distance and angle
+      let distance = Math.sqrt(dx * dx + dy * dy);
+      
+      // Limit within boundary
+      if (distance > maxRadius) {
+        dx = dx * maxRadius / distance;
+        dy = dy * maxRadius / distance;
+        distance = maxRadius;
+      }
+      
+      // Update joystick position
+      thumb.style.left = (centerX + dx - 40) + 'px';
+      thumb.style.top = (centerY + dy - 40) + 'px';
+      
+      // Invert dy, making up positive and down negative
+      dy = -dy;
+      
+      // Calculate differential steering left and right motor values
+      // forwardSpeed controls forward/reverse, turnSpeed controls steering
+      const forwardSpeed = dy / maxRadius * 100;
+      const turnSpeed = dx / maxRadius * 100;
+      
+      // Calculate final speed for left and right motors
+      // Forward(+y) + Right(+x) = Left motor faster
+      // Forward(+y) + Left(-x) = Right motor faster
+      let leftMotorSpeed = Math.round(forwardSpeed + turnSpeed);
+      let rightMotorSpeed = Math.round(forwardSpeed - turnSpeed);
+      
+      // Limit within -100 to 100 range
+      leftMotorSpeed = Math.max(-100, Math.min(100, leftMotorSpeed));
+      rightMotorSpeed = Math.max(-100, Math.min(100, rightMotorSpeed));
+      
+      // Update display and send to backend
+      document.getElementById("motor1Value").innerHTML = leftMotorSpeed;
+      document.getElementById("motor2Value").innerHTML = rightMotorSpeed;
+      
+      // Only send when values change
+      if (currentX !== leftMotorSpeed || currentY !== rightMotorSpeed) {
+        currentX = leftMotorSpeed;
+        currentY = rightMotorSpeed;
+        updateMotor(1, leftMotorSpeed);
+        updateMotor(2, rightMotorSpeed);
+      }
+    }
+    
+    // Mouse event handling
+    container.addEventListener('mousedown', (e) => {
+      isDragging = true;
+      updateJoystickPosition(e.clientX, e.clientY);
+    });
+    
+    document.addEventListener('mousemove', (e) => {
+      if (isDragging) {
+        updateJoystickPosition(e.clientX, e.clientY);
+      }
+    });
+    
+    document.addEventListener('mouseup', () => {
+      if (isDragging) {
+        isDragging = false;
+        // Return to center position
+        thumb.style.left = (centerX - 40) + 'px';
+        thumb.style.top = (centerY - 40) + 'px';
+        // Stop motors
+        updateMotor(1, 0);
+        updateMotor(2, 0);
+        document.getElementById("motor1Value").innerHTML = 0;
+        document.getElementById("motor2Value").innerHTML = 0;
+        currentX = 0;
+        currentY = 0;
+      }
+    });
+    
+    // Touch event handling
+    container.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      isDragging = true;
+      updateJoystickPosition(e.touches[0].clientX, e.touches[0].clientY);
+    });
+    
+    document.addEventListener('touchmove', (e) => {
+      if (isDragging) {
+        e.preventDefault();
+        updateJoystickPosition(e.touches[0].clientX, e.touches[0].clientY);
+      }
+    });
+    
+    document.addEventListener('touchend', () => {
+      if (isDragging) {
+        isDragging = false;
+        // Return to center position
+        thumb.style.left = (centerX - 40) + 'px';
+        thumb.style.top = (centerY - 40) + 'px';
+        // Stop motors
+        updateMotor(1, 0);
+        updateMotor(2, 0);
+        document.getElementById("motor1Value").innerHTML = 0;
+        document.getElementById("motor2Value").innerHTML = 0;
+        currentX = 0;
+        currentY = 0;
+      }
+    });
+    
+    // Initialize joystick
+    window.addEventListener('load', initJoystick);
+    window.addEventListener('resize', initJoystick);
+    
+    function updateMotor(motorNumber, value) {
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", "/motor?num="+motorNumber+"&val="+value, true);
+      xhr.send();
+    }
+    
+    function stopAllMotors() {
+      var xhr = new XMLHttpRequest();
+      xhr.open("GET", "/stopAll", true);
+      xhr.send();
+      
+      // Reset all controllers to center position
+      document.getElementById("motor3Slider").value = 0;
+      document.getElementById("motor3Value").innerHTML = 0;
+      document.getElementById("motor1Value").innerHTML = 0;
+      document.getElementById("motor2Value").innerHTML = 0;
+      thumb.style.left = (centerX - 40) + 'px';
+      thumb.style.top = (centerY - 40) + 'px';
+      currentX = 0;
+      currentY = 0;
+      
+      // Ensure status display updates
+      setTimeout(updateAltitudeStatus, 200);
+    }
+
+    // Add sensor data update function
+    function updateSensorData() {
+      fetch('/sensorData')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('temperature').textContent = data.temperature.toFixed(1);
+          document.getElementById('pressure').textContent = data.pressure.toFixed(1);
+          document.getElementById('altitude').textContent = data.filteredAltitude.toFixed(2);
+        })
+        .catch(error => console.error('Error fetching sensor data:', error));
+    }
+
+    // Start updating sensor data periodically after page loads
+    window.addEventListener('load', function() {
+      updateSensorData(); // Update immediately
+      setInterval(updateSensorData, 1000); // Update every second
+    });
+
+    // Altitude control related functions
+    function updateAltitudeStatus() {
+      fetch('/altitudeStatus')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('initialAltitude').textContent = data.initialAltitude.toFixed(2);
+          document.getElementById('relativeAltitude').textContent = data.currentRelativeAltitude.toFixed(2);
+          document.getElementById('targetAltitudeDisplay').textContent = data.targetAltitude.toFixed(2);
+          
+          // Only update value when input field doesn't have focus
+          const targetInput = document.getElementById('targetAltitude');
+          if (document.activeElement !== targetInput) {
+            targetInput.value = data.targetAltitude.toFixed(1);
+          }
+          
+          // Update auto control button status
+          const autoButton = document.getElementById('autoControlButton');
+          const motor3Slider = document.getElementById('motor3Slider');
+          const sliderContainer = motor3Slider.parentElement;
+          
+          if (data.autoControl) {
+            autoButton.textContent = "Disable Auto Control";
+            autoButton.style.backgroundColor = "#f44336";
+            
+            // Disable vertical motor slider and show notification
+            motor3Slider.disabled = true;
+            
+            // Add notification to slider container
+            if (!document.getElementById('auto-control-notice')) {
+              const notice = document.createElement('div');
+              notice.id = 'auto-control-notice';
+              notice.style.color = '#f44336';
+              notice.style.fontWeight = 'bold';
+              notice.style.fontSize = '0.9rem';
+              notice.style.marginTop = '10px';
+              notice.textContent = "Auto control active";
+              sliderContainer.appendChild(notice);
+            }
+          } else {
+            autoButton.textContent = "Enable Auto Control";
+            autoButton.style.backgroundColor = "#FF9800";
+            
+            // Enable vertical motor slider and remove notification
+            motor3Slider.disabled = false;
+            
+            // Correct way: first check if element exists
+            const notice = document.getElementById('auto-control-notice');
+            if (notice) {
+              notice.remove();
+            }
+          }
+          
+          // If initial altitude not set, disable auto control button
+          autoButton.disabled = !data.initialSet;
+
+          // Update vertical slider control indicator
+          const indicator = document.getElementById('motor3-control-indicator');
+          if (data.autoControl) {
+            indicator.textContent = "Automatic Control";
+            indicator.style.color = "#f44336";
+          } else {
+            indicator.textContent = "Manual Control";
+            indicator.style.color = "#4CAF50";
+          }
+        })
+        .catch(error => console.error('Error getting altitude status:', error));
+    }
+
+    // Calibrate initial altitude
+    function calibrateAltitude() {
+      fetch('/calibrateAltitude')
+        .then(response => response.text())
+        .then(message => {
+          alert(message);
+          updateAltitudeStatus();
+        })
+        .catch(error => console.error('Error calibrating altitude:', error));
+    }
+
+    // Set target altitude
+    function setTargetAltitude() {
+      const value = document.getElementById('targetAltitude').value;
+      fetch(`/setTargetAltitude?value=${value}`)
+        .then(response => response.text())
+        .then(message => {
+          console.log(message);
+          updateAltitudeStatus();
+        })
+        .catch(error => console.error('Error setting target altitude:', error));
+    }
+
+    // Toggle automatic altitude control
+    function toggleAutoAltitude() {
+      // Get current status and toggle
+      fetch('/altitudeStatus')
+        .then(response => response.json())
+        .then(data => {
+          const newState = !data.autoControl;
+          fetch(`/autoAltitude?enable=${newState ? '1' : '0'}`)
+            .then(response => response.text())
+            .then(message => {
+              console.log(message);
+              updateAltitudeStatus();
+              
+              // If enabling auto control, reset slider position
+              if (newState) {
+                // Reset slider UI without sending control command
+                document.getElementById("motor3Slider").value = 0;
+                document.getElementById("motor3Value").innerHTML = 0;
+              }
+            });
+        })
+        .catch(error => console.error('Error toggling automatic altitude control:', error));
+    }
+
+    // Extend existing window.addEventListener('load', ...) function, add altitude status update
+    window.addEventListener('load', function() {
+      // Original initialization code
+      updateSensorData(); 
+      setInterval(updateSensorData, 1000);
+      initJoystick();
+      
+      // Add altitude status update
+      updateAltitudeStatus();
+      setInterval(updateAltitudeStatus, 2000); // Update altitude control status every 2 seconds
+
+      // Load PID parameters
+      loadPidParams();
+    });
+
+    // Add PID parameter update function
+    function updatePidParams() {
+      const kp = document.getElementById('kp').value;
+      const ki = document.getElementById('ki').value;
+      const kd = document.getElementById('kd').value;
+      
+      fetch(`/setPidParams?kp=${kp}&ki=${ki}&kd=${kd}`)
+        .then(response => response.json())
+        .then(data => {
+          console.log('PID parameters updated:', data);
+          // Optional: Display confirmation message
+          alert(`PID parameters updated: Kp=${data.kp}, Ki=${data.ki}, Kd=${data.kd}`);
+        })
+        .catch(error => console.error('Error updating PID parameters:', error));
+    }
+
+    // 修改loadPidParams函数以显示更精确的值
+    function loadPidParams() {
+      fetch('/getPidParams')
+        .then(response => response.json())
+        .then(data => {
+          document.getElementById('kp').value = data.kp.toFixed(2);
+          document.getElementById('ki').value = data.ki.toFixed(3);
+          document.getElementById('kd').value = data.kd.toFixed(2);
+        })
+        .catch(error => console.error('Error getting PID parameters:', error));
+    }
+  </script>
+</body>
+</html>
+)rawliteral";
+
+// 在index_html之后，setup()函数之前添加这段代码
+// HTML for AP mode configuration page
+const char config_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE HTML>
+<html>
+<head>
+  <title>ESP32 WiFi Configuration</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    html {font-family: Arial; display: inline-block; text-align: center;}
+    h2 {font-size: 1.8rem; color: #0066CC;}
+    body {max-width: 600px; margin: 20px auto; padding: 20px; background-color: #f8f9fa;}
+    .input-container {margin: 15px 0; text-align: left; padding: 0 20px;}
+    label {display: block; margin-bottom: 5px; font-weight: bold;}
+    input[type="text"], input[type="password"] {
+      width: 100%; 
+      padding: 10px; 
+      box-sizing: border-box; 
+      border: 1px solid #ddd; 
+      border-radius: 4px; 
+      margin-bottom: 10px;
+    }
+    button {
+      background-color: #0066CC; 
+      color: white; 
+      border: none; 
+      padding: 12px 20px; 
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover {background-color: #0052a3;}
+    .network-list {
+      margin: 15px 0; 
+      max-height: 200px; 
+      overflow-y: auto; 
+      border: 1px solid #ddd; 
+      border-radius: 4px;
+    }
+    .network-item {
+      padding: 10px; 
+      border-bottom: 1px solid #eee; 
+      cursor: pointer; 
+      text-align: left;
+    }
+    .network-item:hover {background-color: #f0f0f0;}
+    .network-name {font-weight: bold;}
+    .network-strength {font-size: 0.8em; color: #666;}
+    .loading {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 3px solid rgba(0,0,0,.3);
+      border-radius: 50%;
+      border-top-color: #0066CC;
+      animation: spin 1s ease-in-out infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <h2>ESP32 WiFi Configuration</h2>
+
+  <div class="input-container">
+    <button onclick="scanWifi()" id="scanButton">Scan WiFi Networks</button>
+    <div id="scanning" style="display: none; margin-top: 10px;">
+      <span class="loading"></span> Scanning networks...
+    </div>
+    <div id="networkList" class="network-list" style="display: none;"></div>
+  </div>
+
+  <form id="wifiForm" action="/save-wifi" method="post">
+    <div class="input-container">
+      <label for="ssid">WiFi Network:</label>
+      <input type="text" id="ssid" name="ssid" placeholder="Enter SSID">
+    </div>
+    <div class="input-container">
+      <label for="password">Password:</label>
+      <input type="password" id="password" name="password" placeholder="Enter password">
+    </div>
+    <button type="submit">Save Configuration</button>
+  </form>
+
+  <script>
+    function scanWifi() {
+      document.getElementById('scanButton').disabled = true;
+      document.getElementById('scanning').style.display = 'block';
+      document.getElementById('networkList').style.display = 'none';
+      
+      fetch('/scan-wifi')
+        .then(response => response.json())
+        .then(networks => {
+          if (networks.length === 0) {
+            setTimeout(checkScanResults, 2000);
+            return;
+          }
+          displayNetworks(networks);
+        })
+        .catch(error => {
+          console.error('Error scanning networks:', error);
+          document.getElementById('scanButton').disabled = false;
+          document.getElementById('scanning').style.display = 'none';
+        });
+    }
+    
+    function checkScanResults() {
+      fetch('/scan-wifi')
+        .then(response => response.json())
+        .then(networks => {
+          if (networks.length === 0) {
+            setTimeout(checkScanResults, 1000);
+            return;
+          }
+          displayNetworks(networks);
+        })
+        .catch(error => {
+          console.error('Error checking scan results:', error);
+          document.getElementById('scanButton').disabled = false;
+          document.getElementById('scanning').style.display = 'none';
+        });
+    }
+    
+    function displayNetworks(networks) {
+      const networkList = document.getElementById('networkList');
+      networkList.innerHTML = '';
+      
+      // Sort networks by signal strength
+      networks.sort((a, b) => b.rssi - a.rssi);
+      
+      networks.forEach(network => {
+        const strengthPercent = mapRSSIToPercentage(network.rssi);
+        const item = document.createElement('div');
+        item.className = 'network-item';
+        item.innerHTML = `
+          <div class="network-name">${network.ssid}</div>
+          <div class="network-strength">Signal Strength: ${strengthPercent}%</div>
+        `;
+        item.onclick = function() {
+          document.getElementById('ssid').value = network.ssid;
+          document.getElementById('password').focus();
+        };
+        networkList.appendChild(item);
+      });
+      
+      document.getElementById('scanButton').disabled = false;
+      document.getElementById('scanning').style.display = 'none';
+      networkList.style.display = 'block';
+    }
+    
+    function mapRSSIToPercentage(rssi) {
+      // RSSI typically ranges from -100 (weak) to -30 (strong)
+      if (rssi >= -30) return 100;
+      if (rssi <= -100) return 0;
+      return Math.round(((rssi + 100) / 70) * 100);
+    }
+    
+    document.getElementById('wifiForm').addEventListener('submit', function(event) {
+      const ssid = document.getElementById('ssid').value.trim();
+      const password = document.getElementById('password').value;
+      
+      if (!ssid) {
+        alert('Please enter a WiFi network name (SSID)');
+        event.preventDefault();
+        return false;
+      }
+      
+      return true;
+    });
+    
+    // Scan WiFi networks when the page loads
+    window.onload = function() {
+      setTimeout(scanWifi, 500);
+    };
+  </script>
+</body>
+</html>
+)rawliteral";
+
+const char* PID_NAMESPACE = "pid_params";
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  Serial.println("\nESP32 Motor Control System Starting");
+  
+  // Initialize I2C bus, using GPIO pins
+  Wire.begin();  // SDA=GPIO 8, SCL=GPIO 9
+  delay(1000);
+  // Initialize MS5611 sensor
+  if (ms5611.begin()) {
+    Serial.println("MS5611 sensor initialized successfully");
+    // Set oversampling rate for higher precision
+    ms5611.setOversampling(OSR_ULTRA_HIGH);
+  } else {
+    Serial.println("Failed to initialize MS5611 sensor! Check wiring.");
+  }
+  
+  // Scan devices on I2C bus
+  scanI2C();
+  
+  // Continue with the original motor initialization code
+  // Configure motor 1 PWM (original code unchanged)
+  ledcSetup(MOTOR1_IN1_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(MOTOR1_IN2_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(motor1_in1, MOTOR1_IN1_CHANNEL);
+  ledcAttachPin(motor1_in2, MOTOR1_IN2_CHANNEL);
+  
+  // Configure motor 2 PWM
+  ledcSetup(MOTOR2_IN1_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(MOTOR2_IN2_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(motor2_in1, MOTOR2_IN1_CHANNEL);
+  ledcAttachPin(motor2_in2, MOTOR2_IN2_CHANNEL);
+  
+  // Configure motor 3 PWM
+  ledcSetup(MOTOR3_IN1_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcSetup(MOTOR3_IN2_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+  ledcAttachPin(motor3_in1, MOTOR3_IN1_CHANNEL);
+  ledcAttachPin(motor3_in2, MOTOR3_IN2_CHANNEL);
+  
+  // Stop all motors initially
+  stopMotor(1);
+  stopMotor(2);
+  stopMotor(3);
+  
+  // WiFi connection logic (replacing original WiFi connection code)
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+  
+  bool hasStoredCredentials = loadSavedWiFiSettings();
+  
+  if (!hasStoredCredentials) {
+    // If no saved credentials, try using hardcoded SSID and password
+    Serial.println("Using default WiFi settings");
+    WiFi.begin(ssid, password);
+  }
+  
+  // Try to connect to WiFi, wait up to 30 seconds
+  Serial.print("Connecting to WiFi");
+  unsigned long wifiConnectStart = millis();
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(1000);
+    
+    // If still not connected after 30 seconds, switch to AP mode
+    if (millis() - wifiConnectStart > 30000) {
+      Serial.println("\nWiFi connection timeout!");
+      startAPMode();
+      break;
+    }
+  }
+  
+  // If connection successful (not in AP mode)
+  if (!apMode) {
+    Serial.println("");
+    Serial.println("WiFi connected");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+    
+    // Initialize WiFi status
+    lastWifiConnected = true;
+    
+    // Configure regular web service (original code)
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+      request->send_P(200, "text/html", index_html);
+    });
+
+    // Route for motor control
+    server.on("/motor", HTTP_GET, [](AsyncWebServerRequest *request) {
+      String motorNum;
+      String motorVal;
+      
+      if (request->hasParam("num") && request->hasParam("val")) {
+        motorNum = request->getParam("num")->value();
+        motorVal = request->getParam("val")->value();
+        
+        int num = motorNum.toInt();
+        int val = motorVal.toInt();
+        
+        // 如果是motor3且自动高度控制激活，则忽略手动控制请求
+        if (num == 3 && altitudeController.isActive()) {
+          request->send(200, "text/plain", "Motor 3 is under automatic control");
+          return;
+        }
+        
+        // 正常处理电机控制
+        if (val > 0) {
+          // Positive value = forward
+          uint16_t speed = map(val, 0, 100, 0, 1023);
+          setMotor(num, true, speed);
+        } else if (val < 0) {
+          // Negative value = backward
+          uint16_t speed = map(abs(val), 0, 100, 0, 1023);
+          setMotor(num, false, speed);
+        } else if (val == 0) {
+          // Zero = stop
+          stopMotor(num);
+          Serial.println("fuck1");
+        }
+      }
+      request->send(200, "text/plain", "OK");
+    });
+
+    // Route for stopping all motors
+    server.on("/stopAll", HTTP_GET, [](AsyncWebServerRequest *request) {
+      stopMotor(1);
+      stopMotor(2);
+      stopMotor(3);
+      
+      // Stop automatic altitude control
+      altitudeController.disable();
+      
+      request->send(200, "text/plain", "All motors stopped, automatic altitude control disabled");
+    });
+
+    // Add sensor data API
+    server.on("/sensorData", HTTP_GET, [](AsyncWebServerRequest *request) {
+      String json = "{\"temperature\":";
+      json += temperature;
+      json += ",\"pressure\":";
+      json += pressure;
+      json += ",\"rawAltitude\":";
+      json += altitudeBuffer[((altitudeBufferIndex - 1 + ALTITUDE_FILTER_SIZE) % ALTITUDE_FILTER_SIZE)]; // Most recent raw value
+      json += ",\"filteredAltitude\":";
+      json += filteredAltitude;
+      json += "}";
+      request->send(200, "application/json", json);
+    });
+
+    // Calibrate initial altitude
+    server.on("/calibrateAltitude", HTTP_GET, [](AsyncWebServerRequest *request) {
+      altitudeController.calibrateInitialValue(filteredAltitude);
+      request->send(200, "text/plain", "Initial altitude calibrated");
+    });
+
+    // Set target altitude
+    server.on("/setTargetAltitude", HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (request->hasParam("value")) {
+        float target = request->getParam("value")->value().toFloat();
+        altitudeController.setTargetValue(target);
+        request->send(200, "text/plain", "Target altitude set");
+      } else {
+        request->send(400, "text/plain", "Missing value parameter");
+      }
+    });
+
+    // Enable/disable automatic altitude control
+    server.on("/autoAltitude", HTTP_GET, [](AsyncWebServerRequest *request) {
+      if (request->hasParam("enable")) {
+        String value = request->getParam("enable")->value();
+        bool enable = (value == "1" || value == "true");
+        
+        if (enable) {
+          // If initial altitude is not set, calibrate automatically
+          if (!altitudeController.isInitialValueSet()) {
+            altitudeController.calibrateInitialValue(filteredAltitude);
+          }
+          altitudeController.enable();
+        } else {
+          altitudeController.disable();
+          stopMotor(3); // If disabling automatic control, stop motor 3
+          Serial.println("fuck2");
+        }
+        
+        request->send(200, "text/plain", enable ? "Automatic altitude control enabled" : "Automatic altitude control disabled");
+      } else {
+        request->send(400, "text/plain", "Missing enable parameter");
+      }
+    });
+
+    // Get altitude control status
+    server.on("/altitudeStatus", HTTP_GET, [](AsyncWebServerRequest *request) {
+      String json = "{\"initialAltitude\":";
+      json += altitudeController.getInitialValue();
+      json += ",\"targetAltitude\":";
+      json += altitudeController.getTarget();
+      json += ",\"currentRelativeAltitude\":";
+      json += altitudeController.getCurrentRelative(filteredAltitude);
+      json += ",\"autoControl\":";
+      json += altitudeController.isActive() ? "true" : "false";
+      json += ",\"initialSet\":";
+      json += altitudeController.isInitialValueSet() ? "true" : "false";
+      json += "}";
+      request->send(200, "application/json", json);
+    });
+
+    // 在其他API定义部分添加PID参数设置端点
+    server.on("/setPidParams", HTTP_GET, [](AsyncWebServerRequest *request) {
+      bool hasChanges = false;
+      
+      if (request->hasParam("kp")) {
+        float kp = request->getParam("kp")->value().toFloat();
+        altitudeController.setKp(kp);
+        hasChanges = true;
+      }
+      
+      if (request->hasParam("ki")) {
+        float ki = request->getParam("ki")->value().toFloat();
+        altitudeController.setKi(ki);
+        hasChanges = true;
+      }
+      
+      if (request->hasParam("kd")) {
+        float kd = request->getParam("kd")->value().toFloat();
+        altitudeController.setKd(kd);
+        hasChanges = true;
+      }
+      
+      if (hasChanges) {
+        // Output new parameter values for debugging
+        Serial.printf("PID parameters updated: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", 
+             altitudeController.getKp(), 
+             altitudeController.getKi(), 
+             altitudeController.getKd());
+        preferences.begin(PID_NAMESPACE, false);
+        preferences.putFloat("kp", altitudeController.getKp());
+        preferences.putFloat("ki", altitudeController.getKi());
+        preferences.putFloat("kd", altitudeController.getKd());
+        preferences.end();
+        
+        Serial.println("PID parameters saved to Flash");
+      }
+      
+      // 返回当前参数
+      String json = "{\"kp\":";
+      json += altitudeController.getKp();
+      json += ",\"ki\":";
+      json += altitudeController.getKi();
+      json += ",\"kd\":";
+      json += altitudeController.getKd();
+      json += "}";
+      
+      request->send(200, "application/json", json);
+    });
+
+    // 获取当前PID参数的端点
+    server.on("/getPidParams", HTTP_GET, [](AsyncWebServerRequest *request) {
+      String json = "{\"kp\":";
+      json += altitudeController.getKp();
+      json += ",\"ki\":";
+      json += altitudeController.getKi();
+      json += ",\"kd\":";
+      json += altitudeController.getKd();
+      json += "}";
+      
+      request->send(200, "application/json", json);
+    });
+
+  }
+
+
+  // Start web server
+  server.begin();
+  Serial.println("HTTP server started");
+
+  loadPidParameters();
+}
+
+void loop() {
+  // Original AP mode handling code remains unchanged
+  if (apMode) {
+    handleDNS();
+    checkAPTimeout();
+    delay(10);
+    return;
+  }
+
+  // Get current time
+  unsigned long currentMillis = millis();
+  
+  // Read sensor data
+  if (currentMillis - lastSensorReadTime >= sensorReadInterval) {
+    readSensorData();
+    lastSensorReadTime = currentMillis;
+  }
+  
+  // Use PID controller to control altitude
+  if (altitudeController.isActive()) {
+    static unsigned long lastPidUpdateTime = 0;
+    static int lastPidOutput = 0;
+    static bool motorStopped = true;
+    static unsigned long stableZeroTime = 0;
+    
+    unsigned long currentTime = millis();
+    if (currentTime - lastPidUpdateTime >= 50) {  // 更新为50ms
+      lastPidUpdateTime = currentTime;
+      
+      int pidOutput = altitudeController.compute(filteredAltitude);
+      
+      // 减小死区阈值，以适应厘米级控制
+      const int MIN_OUTPUT_THRESHOLD = 3;  // 从5减小到3
+           
+      // 改进死区控制逻辑，防止频繁启停
+      if (abs(pidOutput) <= MIN_OUTPUT_THRESHOLD) {
+        // 使用平滑过渡
+        if (!motorStopped) {
+          if (stableZeroTime == 0) {
+            stableZeroTime = currentTime;
+          } else if (currentTime - stableZeroTime > 100) { // 减小稳定时间
+            pidOutput = 0;
+            motorStopped = true;
+            stableZeroTime = 0;
+          } else {
+            // 在过渡期间保持最小输出
+            pidOutput = (lastPidOutput > 0) ? MIN_OUTPUT_THRESHOLD : 
+                       (lastPidOutput < 0) ? -MIN_OUTPUT_THRESHOLD : 0;
+          }
+        } else {
+          pidOutput = 0;
+        }
+      } else {
+        motorStopped = false;
+        stableZeroTime = 0;
+      }
+      
+      lastPidOutput = pidOutput;
+      
+      // 控制电机...其余代码保持不变
+      // Control motor
+      if (pidOutput > 0) {
+        // Ascend
+        uint16_t speed = map(pidOutput, MIN_OUTPUT_THRESHOLD, 100, 200, 1023);
+        setMotor(3, true, speed);
+      } else if (pidOutput < 0) {
+        // Descend
+        uint16_t speed = map(abs(pidOutput), MIN_OUTPUT_THRESHOLD, 100, 200, 1023);
+        setMotor(3, false, speed);
+      } else {
+        // Stop
+        stopMotor(3);
+        Serial.println("FUCK3");
+      }
+    }
+    // If not time to update, do nothing and maintain previous motor state
+  } 
+  
+  // WiFi connection monitoring and auto-reconnect code
+  bool currentlyConnected = (WiFi.status() == WL_CONNECTED);
+  
+  // Stop all motors when WiFi changes from connected to disconnected for safety
+  if (lastWifiConnected && !currentlyConnected) {
+    stopMotor(1);
+    stopMotor(2);
+    stopMotor(3);
+    Serial.println("WiFi connection lost - stopping all motors for safety");
+    reconnectAttempts = 0;
+    lastReconnectTime = currentMillis;
+  }
+  // Print new IP address when WiFi reconnects
+  else if (!lastWifiConnected && currentlyConnected) {
+    Serial.println("WiFi reconnected.");
+    Serial.print("New IP address: ");
+    Serial.println(WiFi.localIP());
+    reconnectAttempts = 0;
+  }
+  
+  // Update previous connection state
+  lastWifiConnected = currentlyConnected;
+  
+  // Try to reconnect to WiFi if disconnected, with retry limits and intervals
+  if (!currentlyConnected && reconnectAttempts < maxReconnectAttempts) {
+    if (currentMillis - lastReconnectTime > reconnectInterval) {
+      reconnectAttempts++;
+      Serial.printf("WiFi disconnected. Trying to reconnect... (Attempt %d/%d)\n", reconnectAttempts, maxReconnectAttempts);
+      WiFi.disconnect();
+      delay(100);
+      WiFi.begin();  // Auto reconnect using saved credentials
+      lastReconnectTime = currentMillis;
+    }
+  }
+  // Enter AP mode if maximum reconnection attempts are reached
+  else if (!currentlyConnected && reconnectAttempts >= maxReconnectAttempts) {
+    Serial.println("Maximum reconnection attempts reached. Switching to AP mode...");
+    startAPMode();
+  }
+
+  // delay(10);  // Short delay
+}
+
+/**
+ * Control motor direction and speed
+ * @param motorNum - Motor number (1-3)
+ * @param forward - true for forward, false for backward
+ * @param speed - PWM value (0-15)
+ */
+void setMotor(int motorNum, bool forward, uint16_t speed) {
+  int in1_channel, in2_channel;
+  
+  // Select the correct PWM channels
+  switch(motorNum) {
+    case 1:
+      in1_channel = MOTOR1_IN1_CHANNEL;
+      in2_channel = MOTOR1_IN2_CHANNEL;
+      break;
+    case 2:
+      in1_channel = MOTOR2_IN1_CHANNEL;
+      in2_channel = MOTOR2_IN2_CHANNEL;
+      break;
+    case 3:
+      in1_channel = MOTOR3_IN1_CHANNEL;
+      in2_channel = MOTOR3_IN2_CHANNEL;
+      break;
+    default:
+      return; // Invalid motor number
+  }
+  
+  if (forward) {
+    // Forward: IN1=PWM, IN2=0
+    ledcWrite(in1_channel, speed);
+    ledcWrite(in2_channel, 0);
+  } else {
+    // Backward: IN1=0, IN2=PWM
+    ledcWrite(in1_channel, 0);
+    ledcWrite(in2_channel, speed);
+  }
+  
+  Serial.printf("Motor %d set to %s at speed %d\n", 
+                motorNum, forward ? "forward" : "backward", speed);
+}
+
+/**
+ * Stop motor (coast to stop)
+ * @param motorNum - Motor number (1-3)
+ */
+void stopMotor(int motorNum) {
+  int in1_channel, in2_channel;
+  
+  switch(motorNum) {
+    case 1:
+      in1_channel = MOTOR1_IN1_CHANNEL;
+      in2_channel = MOTOR1_IN2_CHANNEL;
+      break;
+    case 2:
+      in1_channel = MOTOR2_IN1_CHANNEL;
+      in2_channel = MOTOR2_IN2_CHANNEL;
+      break;
+    case 3:
+      in1_channel = MOTOR3_IN1_CHANNEL;
+      in2_channel = MOTOR3_IN2_CHANNEL;
+      break;
+    default:
+      return; // Invalid motor number
+  }
+  
+  // Both inputs LOW = coast to stop
+  ledcWrite(in1_channel, 0);
+  ledcWrite(in2_channel, 0);
+  
+  Serial.printf("Motor %d stopped\n", motorNum);
+}
+
+// Start AP mode
+void startAPMode() {
+  apMode = true;
+  apStartTime = millis();
+  
+  // Stop STA mode connection attempts
+  WiFi.disconnect();
+  
+  // Configure AP
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  
+  Serial.println("\n========== Entering AP Configuration Mode ==========");
+  Serial.print("AP Name: ");
+  Serial.println(AP_SSID);
+  Serial.print("AP IP Address: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.println("Please connect to this WiFi using your phone or computer and visit http://192.168.4.1 to configure");
+  Serial.println("=====================================");
+
+  // Configure DNS server (capture all domain requests)
+  dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
+  
+  // Configure regular web service (original code)
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", index_html);
+  });
+
+  // Add routes for configuration mode
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    request->send_P(200, "text/html", config_html);
+  });
+
+  // Handle WiFi scan requests
+  server.on("/scan-wifi", HTTP_GET, [](AsyncWebServerRequest *request) {
+    String json = "[";
+    int n = WiFi.scanComplete();
+    
+    if(n == -2){
+      // Trigger a WiFi scan
+      WiFi.scanNetworks(true);
+      request->send(200, "application/json", "[]");
+      return;
+    }
+    
+    // Scan complete, build JSON response
+    for (int i = 0; i < n; ++i) {
+      if (i > 0) json += ",";
+      json += "{\"ssid\":\"";
+      json += WiFi.SSID(i);
+      json += "\",\"rssi\":";
+      json += WiFi.RSSI(i);
+      json += "}";
+    }
+    json += "]";
+    
+    // Delete scan results and start new scan
+    WiFi.scanDelete();
+    if(WiFi.scanComplete() == -2){
+      WiFi.scanNetworks(true);
+    }
+    
+    request->send(200, "application/json", json);
+  });
+
+  // Handle saving WiFi settings request
+  server.on("/save-wifi", HTTP_POST, [](AsyncWebServerRequest *request) {
+    String ssid, password;
+    if (request->hasParam("ssid", true) && request->hasParam("password", true)) {
+      ssid = request->getParam("ssid", true)->value();
+      password = request->getParam("password", true)->value();
+      
+      // Save WiFi settings
+      preferences.begin("wifi", false);
+      preferences.putString("ssid", ssid);
+      preferences.putString("password", password);
+      preferences.end();
+      
+      request->send(200, "text/plain", "WiFi configuration successful! Device will restart in 10 seconds...");
+      
+      // Delay before restarting ESP32
+      delay(500);  // Ensure response is sent
+      
+      // Use a timer to restart after 10 seconds so the user can see the success message
+      static bool restartScheduled = false;
+      if(!restartScheduled) {
+        restartScheduled = true;
+        Serial.println("WiFi settings saved, restarting in 10 seconds...");
+        Serial.print("New SSID: ");
+        Serial.println(ssid);
+        delay(10000); // Wait for 10 seconds
+        ESP.restart();
+      }
+    } else {
+      request->send(400, "text/plain", "Please provide both SSID and password");
+    }
+  });
+}
+
+// Handle DNS requests in AP mode
+void handleDNS() {
+  dnsServer.processNextRequest();
+}
+
+// Check for configuration mode timeout
+bool checkAPTimeout() {
+  if(apMode && millis() - apStartTime > CONFIG_PORTAL_TIMEOUT * 1000) {
+    Serial.println("Configuration mode timeout, restarting device...");
+    delay(500);
+    ESP.restart();
+    return true;
+  }
+  return false;
+}
+
+// Try to restore WiFi settings from storage
+bool loadSavedWiFiSettings() {
+  preferences.begin("wifi", true);
+  String saved_ssid = preferences.getString("ssid", "");
+  String saved_password = preferences.getString("password", "");
+  preferences.end();
+  
+  if(saved_ssid.length() > 0) {
+    Serial.println("Found saved WiFi settings");
+    Serial.print("SSID: ");
+    Serial.println(saved_ssid);
+    Serial.println("Attempting to connect...");
+    
+    WiFi.begin(saved_ssid.c_str(), saved_password.c_str());
+    return true;
+  }
+  
+  return false;
+}
+
+// Read MS5611 sensor data
+void readSensorData() {
+  tempReadCounter++;
+  // Then read pressure and calculate altitude
+  if (tempReadCounter < TEMP_READ_INTERVAL) {
+    if (ms5611.read() == MS5611_READ_OK) {
+      pressure = ms5611.getPressure();
+      // Calculate raw altitude
+      float rawAltitude = 44330.0 * (1.0 - pow(pressure / 1013.25, 0.1903));
+      
+      // Pass raw altitude to filter
+      updateAltitudeFilter(rawAltitude);
+      
+      // Update global altitude variable with filtered altitude
+      altitude = filteredAltitude;
+      
+      // Serial.print("Pressure: ");
+      // Serial.print(pressure);
+      // Serial.println(" mBar");
+      Serial.print("Raw Altitude: ");
+      Serial.print(rawAltitude);
+      Serial.println(" m");
+      Serial.print("Filtered Altitude: ");
+      Serial.print(altitude);
+      Serial.println(" m");
+    } else {
+      Serial.println("Failed to read pressure");
+    }
+  }else {
+    // 偶尔读取温度
+    tempReadCounter = 0;
+    if (ms5611.read() == MS5611_READ_OK) {
+      temperature = ms5611.getTemperature();
+    }
+  }
+  
+}
+
+// Scan for devices on I2C bus
+void scanI2C() {
+  byte error, address;
+  int deviceCount = 0;
+  
+  Serial.println("Scanning I2C bus...");
+  for (address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    
+    if (error == 0) {
+      Serial.print("I2C device found at address 0x");
+      if (address < 16) Serial.print("0");
+      Serial.print(address, HEX);
+      Serial.println();
+      deviceCount++;
+    }
+  }
+  
+  if (deviceCount == 0) {
+    Serial.println("No I2C devices found! Check wiring.");
+  } else {
+    Serial.print("Found ");
+    Serial.print(deviceCount);
+    Serial.println(" device(s)");
+  }
+}
+
+// Update altitude filter
+void updateAltitudeFilter(float newAltitude) {
+  // Store new altitude value in buffer
+  altitudeBuffer[altitudeBufferIndex] = newAltitude;
+  
+  // Update index, implementing circular buffer
+  altitudeBufferIndex = (altitudeBufferIndex + 1) % ALTITUDE_FILTER_SIZE;
+  
+  // Check if buffer has been filled completely
+  if (altitudeBufferIndex == 0) {
+    altitudeBufferFilled = true;
+  }
+  
+  // Calculate filtered altitude
+  float sum = 0;
+  int count = altitudeBufferFilled ? ALTITUDE_FILTER_SIZE : altitudeBufferIndex;
+  
+  for (int i = 0; i < count; i++) {
+    sum += altitudeBuffer[i];
+  }
+  
+  filteredAltitude = (count > 0) ? sum / count : newAltitude;
+}
+
+void loadPidParameters() {
+  preferences.begin(PID_NAMESPACE, true);
+  
+  float kp = preferences.getFloat("kp", 20.0); 
+  float ki = preferences.getFloat("ki", 0.1);
+  float kd = preferences.getFloat("kd", 5.0);
+  
+  altitudeController.setKp(kp);
+  altitudeController.setKi(ki);
+  altitudeController.setKd(kd);
+  
+  preferences.end();
+  
+  Serial.printf("PID parameters loaded: Kp=%.2f, Ki=%.2f, Kd=%.2f\n", kp, ki, kd);
+}
