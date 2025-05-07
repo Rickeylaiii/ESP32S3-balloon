@@ -67,13 +67,20 @@ const int motor3_in2 = 17; // Motor 3 input 2
 #define PWM_FREQUENCY 15000  // 15KHz
 #define PWM_RESOLUTION 10    // 10-bit resolution (0-1023)
 
+// 在全局变量区域添加
+#define SERVO_FREQ 50  // 50Hz 舵机/电调标准频率 (20ms周期)
+#define SERVO_RESOLUTION 12 // 使用16位分辨率以获得更高精度
+#define SERVO_MIN_US 1000   // 1000微秒 - 最大正向速度
+#define SERVO_MID_US 1500   // 1500微秒 - 停止
+#define SERVO_MAX_US 2000   // 2000微秒 - 最大反向速度
+
 // PWM channel assignments
 #define MOTOR1_IN1_CHANNEL 0
 #define MOTOR1_IN2_CHANNEL 1
 #define MOTOR2_IN1_CHANNEL 2
 #define MOTOR2_IN2_CHANNEL 3
-#define MOTOR3_IN1_CHANNEL 4
-#define MOTOR3_IN2_CHANNEL 5
+// 修改电机3通道定义，只用一个通道
+#define MOTOR3_PWM_CHANNEL 4  // 统一使用单通道
 
 // Create AsyncWebServer object on port 80
 AsyncWebServer server(80);
@@ -214,6 +221,10 @@ const char index_html[] PROGMEM = R"rawliteral(
       <div style="margin: 10px 20px; text-align: center;">
         <div style="font-weight: bold; color: #FF9800;">Altitude</div>
         <div style="font-size: 1.4rem;"><span id="altitude">--</span> m</div>
+      </div>
+      <div style="margin: 10px 20px; text-align: center;">
+        <div style="font-weight: bold; color: #E91E63;">Vertical Speed</div>
+        <div style="font-size: 1.4rem;"><span id="verticalSpeed">--</span> m/s</div>
       </div>
     </div>
   </div>
@@ -430,24 +441,24 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     // Updated sensor data function
-    function updateSensorData() {
-      fetch('/sensorData')
-        .then(response => {
-          if (!response.ok) {
-            throw new Error('Network response was not ok');
-          }
-          return response.json();
-        })
-        .then(data => {
-          document.getElementById('temperature').textContent = data.temperature.toFixed(1);
-          document.getElementById('pressure').textContent = data.pressure.toFixed(1);
-          document.getElementById('altitude').textContent = data.filteredAltitude.toFixed(2);
-        })
-        .catch(error => {
-          console.error('Error fetching sensor data:', error);
-          // Will retry on next interval
-        });
-    }
+  function updateSensorData() {
+    fetch('/sensorData')
+      .then(response => {
+        if (!response.ok) {
+          throw new Error('Network response was not ok');
+        }
+        return response.json();
+      })
+      .then(data => {
+        document.getElementById('temperature').textContent = data.temperature.toFixed(1);
+        document.getElementById('pressure').textContent = data.pressure.toFixed(1);
+        document.getElementById('altitude').textContent = data.filteredAltitude.toFixed(2);
+        document.getElementById('verticalSpeed').textContent = data.verticalSpeed.toFixed(2);
+      })
+      .catch(error => {
+        console.error('Error fetching sensor data:', error);
+      });
+  }
 
     // Start updating sensor data periodically after page loads
     window.addEventListener('load', function() {
@@ -944,6 +955,7 @@ typedef struct {
     float pressure;             // 压力 (mBar)
     float rawAltitude;          // 原始高度 (m)
     float filteredAltitude;     // 滤波后高度 (m)
+    float verticalSpeed;        // 垂直速度 (m/s)
     unsigned long lastReadTime; // 最后读取时间 (ms)
 } SensorData_t;
 
@@ -1075,45 +1087,76 @@ void loop() {
     // vTaskDelay(pdMS_TO_TICKS(1000));
 }
 
+// Add servo pulse width mapping function
+uint32_t mapMotorValueToPulseWidth(int value) {
+  // Map values from -100 to +100 to 1000us to 2000us
+  // Note: -100 corresponds to 1000us (max forward), 0 corresponds to 1500us (stop), +100 corresponds to 2000us (max reverse)
+  const int deadband = 7;
+  if (abs(value) <= deadband) {
+      // Deadband: 0 to 7 maps to 1500us (stop)
+    value = 0;
+  }
+
+  uint32_t pulseWidth;
+  
+  if (value < 0) {
+      // -100 to 0 maps to 1000us to 1500us (forward speed)
+      pulseWidth = map(value, -100, 0, SERVO_MIN_US, SERVO_MID_US);
+  } else {
+      // 0 to +100 maps to 1500us to 2000us (reverse speed)
+      pulseWidth = map(value, 0, 100, SERVO_MID_US, SERVO_MAX_US);
+  }
+  
+  // Convert microseconds to count value (based on PWM resolution and frequency)
+  // For 50Hz PWM, the period is 20ms (20000us)
+  // For 16-bit resolution, the maximum count value is 65535
+  uint32_t dutyCycle = (pulseWidth * 4096) / 20000;
+  // // 对于10位分辨率(0-1023)
+  // uint32_t dutyCycle = (pulseWidth * 1024) / 20000;
+
+  
+  Serial.printf("Motor value: %d, Pulse width: %d us, Duty cycle count: %d\n", value, pulseWidth, dutyCycle);
+  return dutyCycle;
+}
 /**
  * Control motor direction and speed
  * @param motorNum - Motor number (1-3)
  * @param forward - true for forward, false for backward
- * @param speed - PWM value (0-15)
+ * @param speed - PWM value (0-1023)
  */
 void setMotor(int motorNum, bool forward, uint16_t speed) {
-  int in1_channel, in2_channel;
-  
-  // Select the correct PWM channels
-  switch(motorNum) {
-    case 1:
-      in1_channel = MOTOR1_IN1_CHANNEL;
-      in2_channel = MOTOR1_IN2_CHANNEL;
-      break;
-    case 2:
-      in1_channel = MOTOR2_IN1_CHANNEL;
-      in2_channel = MOTOR2_IN2_CHANNEL;
-      break;
-    case 3:
-      in1_channel = MOTOR3_IN1_CHANNEL;
-      in2_channel = MOTOR3_IN2_CHANNEL;
-      break;
-    default:
-      return; // Invalid motor number
+  // Motors 1 and 2 use H-bridge driver method
+  if (motorNum == 1 || motorNum == 2) {
+      int in1_channel, in2_channel;
+      
+      // Select the correct PWM channels
+      if (motorNum == 1) {
+          in1_channel = MOTOR1_IN1_CHANNEL;
+          in2_channel = MOTOR1_IN2_CHANNEL;
+      } else { // motorNum == 2
+          in1_channel = MOTOR2_IN1_CHANNEL;
+          in2_channel = MOTOR2_IN2_CHANNEL;
+      }
+      
+      if (forward) {
+          // Forward: IN1=PWM, IN2=0
+          ledcWrite(in1_channel, speed);
+          ledcWrite(in2_channel, 0);
+      } else {
+          // Reverse: IN1=0, IN2=PWM
+          ledcWrite(in1_channel, 0);
+          ledcWrite(in2_channel, speed);
+      }
+      
+      Serial.printf("Motor %d set to %s, speed %d\n", 
+              motorNum, forward ? "forward" : "reverse", speed);
   }
-  
-  if (forward) {
-    // Forward: IN1=PWM, IN2=0
-    ledcWrite(in1_channel, speed);
-    ledcWrite(in2_channel, 0);
-  } else {
-    // Backward: IN1=0, IN2=PWM
-    ledcWrite(in1_channel, 0);
-    ledcWrite(in2_channel, speed);
+  // Motor 3 uses BEC driver
+  else if (motorNum == 3) {
+      // Note: This function doesn't directly use forward and speed parameters
+      // Motor 3 control logic has been moved to dedicated code in motorTask
+      Serial.printf("Warning: Motor 3 uses BEC driver, should be handled through motorTask\n");
   }
-  
-  Serial.printf("Motor %d set to %s at speed %d\n", 
-                motorNum, forward ? "forward" : "backward", speed);
 }
 
 /**
@@ -1121,28 +1164,31 @@ void setMotor(int motorNum, bool forward, uint16_t speed) {
  * @param motorNum - Motor number (1-3)
  */
 void stopMotor(int motorNum) {
-  int in1_channel, in2_channel;
-  
-  switch(motorNum) {
-    case 1:
-      in1_channel = MOTOR1_IN1_CHANNEL;
-      in2_channel = MOTOR1_IN2_CHANNEL;
-      break;
-    case 2:
-      in1_channel = MOTOR2_IN1_CHANNEL;
-      in2_channel = MOTOR2_IN2_CHANNEL;
-      break;
-    case 3:
-      in1_channel = MOTOR3_IN1_CHANNEL;
-      in2_channel = MOTOR3_IN2_CHANNEL;
-      break;
-    default:
-      return; // Invalid motor number
+  if (motorNum == 1 || motorNum == 2) {
+      int in1_channel, in2_channel;
+      
+      switch(motorNum) {
+          case 1:
+              in1_channel = MOTOR1_IN1_CHANNEL;
+              in2_channel = MOTOR1_IN2_CHANNEL;
+              break;
+          case 2:
+              in1_channel = MOTOR2_IN1_CHANNEL;
+              in2_channel = MOTOR2_IN2_CHANNEL;
+              break;
+          default:
+              return; // Don't process motor 3
+      }
+      
+      // Both inputs LOW = coast to stop
+      ledcWrite(in1_channel, 0);
+      ledcWrite(in2_channel, 0);
   }
-  
-  // Both inputs LOW = coast to stop
-  ledcWrite(in1_channel, 0);
-  ledcWrite(in2_channel, 0);
+  else if (motorNum == 3) {
+      // Motor 3 stop = 1500us pulse width
+      uint32_t stopPulse = (SERVO_MID_US * 4096) / 20000;
+      ledcWrite(MOTOR3_PWM_CHANNEL, stopPulse);
+  }
   
   Serial.printf("Motor %d stopped\n", motorNum);
 }
@@ -1417,9 +1463,14 @@ void pidTask(void *pvParameters) {
             if (xQueueReceive(altitudeQueue, &currentAltitude, 0) == pdTRUE) {
                 // 计算PID输出
                 pidOutput = altitudeController.compute(currentAltitude);
-                
+                // // ========== 在这里添加速度限制 ==========
+                // const float maxRateOfChange = 5.0; // 每个控制周期最大变化率(5%)
+                // // 限制输出变化速率
+                // pidOutput = constrain(pidOutput, 
+                //                       lastPidOutput - maxRateOfChange, 
+                //                       lastPidOutput + maxRateOfChange);
                 // 死区控制逻辑
-                const int MIN_OUTPUT_THRESHOLD = 3;
+                const int MIN_OUTPUT_THRESHOLD = 7;
                 
                 if (abs(pidOutput) <= MIN_OUTPUT_THRESHOLD) {
                     if (!motorStopped) {
@@ -1466,56 +1517,73 @@ void pidTask(void *pvParameters) {
     }
 }
 
-// 电机控制任务
+// Motor control task
 void motorTask(void *pvParameters) {
-    MotorCommand_t cmd;
-    
-    // 任务循环
-    while (1) {
-        // 等待电机控制命令
-        if (xQueueReceive(motorCommandQueue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE) {
-            int motorNum = cmd.motorNum;
-            int value = cmd.value;
-            
-            // 如果是自动控制来源且当前自动控制未激活，忽略命令
-            bool shouldExecute = true;
-            if (cmd.fromAuto) {
-                if (xSemaphoreTake(motorStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                    shouldExecute = g_motorState.autoControlActive;
-                    xSemaphoreGive(motorStateMutex);
-                }
-            }
-            
-            if (shouldExecute) {
-                // 更新电机状态
-                if (xSemaphoreTake(motorStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
-                    switch (motorNum) {
-                        case 1: g_motorState.motor1Speed = value; break;
-                        case 2: g_motorState.motor2Speed = value; break;
-                        case 3: g_motorState.motor3Speed = value; break;
-                    }
-                    xSemaphoreGive(motorStateMutex);
-                }
-                
-                // 控制电机
-                if (value > 0) {
-                    // 正向
-                    uint16_t speed = map(value, 0, 100, 0, 1023);
-                    setMotor(motorNum, true, speed);
-                } else if (value < 0) {
-                    // 反向
-                    uint16_t speed = map(abs(value), 0, 100, 0, 1023);
-                    setMotor(motorNum, false, speed);
-                } else {
-                    // 停止
-                    stopMotor(motorNum);
-                }
-            }
-        }
-        
-        // 轻微延迟，避免过度消耗CPU
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
+  MotorCommand_t cmd;
+  
+  // Task loop
+  while (1) {
+      // Wait for motor control commands
+      if (xQueueReceive(motorCommandQueue, &cmd, pdMS_TO_TICKS(10)) == pdTRUE) {
+          int motorNum = cmd.motorNum;
+          int value = cmd.value;
+          
+          // If command is from auto control but auto control is not active, ignore the command
+          bool shouldExecute = true;
+          if (cmd.fromAuto) {
+              if (xSemaphoreTake(motorStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                  shouldExecute = g_motorState.autoControlActive;
+                  xSemaphoreGive(motorStateMutex);
+              }
+          }
+          
+          if (shouldExecute) {
+              // Update motor state
+              if (xSemaphoreTake(motorStateMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+                  switch (motorNum) {
+                      case 1: g_motorState.motor1Speed = value; break;
+                      case 2: g_motorState.motor2Speed = value; break;
+                      case 3: g_motorState.motor3Speed = value; break;
+                  }
+                  xSemaphoreGive(motorStateMutex);
+              }
+              
+              // Control motors
+              if (motorNum == 1 || motorNum == 2) {
+                  // Motors 1 and 2 maintain the original H-bridge control method
+                  if (value > 0) {
+                      // Forward
+                      uint16_t speed = map(value, 0, 100, 0, 1023);
+                      setMotor(motorNum, true, speed);
+                  } else if (value < 0) {
+                      // Reverse
+                      uint16_t speed = map(abs(value), 0, 100, 0, 1023);
+                      setMotor(motorNum, false, speed);
+                  } else {
+                      // Stop
+                      stopMotor(motorNum);
+                  }
+              }
+              else if (motorNum == 3) {
+                  // Motor 3 uses BEC control method
+                  // Map values from -100 to +100 to PWM signals from 1000us to 2000us
+                  uint32_t dutyCycle = mapMotorValueToPulseWidth(value);
+                  ledcWrite(MOTOR3_PWM_CHANNEL, dutyCycle);
+                  
+                  // Output debug info
+                  if (value == 0) {
+                      Serial.println("Motor 3 stopped (1500us)");
+                  } else {
+                      Serial.printf("Motor 3 set to %d%% (%s direction)\n", 
+                                    abs(value), value < 0 ? "forward" : "reverse");
+                  }
+              }
+          }
+      }
+      
+      // Small delay to avoid excessive CPU consumption
+      vTaskDelay(pdMS_TO_TICKS(1));
+  }
 }
 
 // 修改WiFi任务中的重连逻辑
@@ -1603,23 +1671,23 @@ void initMotors() {
     pinMode(motor2_in1, OUTPUT);
     pinMode(motor2_in2, OUTPUT);
     pinMode(motor3_in1, OUTPUT);
-    pinMode(motor3_in2, OUTPUT);
     
     // 配置LEDC PWM通道
     ledcSetup(MOTOR1_IN1_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
     ledcSetup(MOTOR1_IN2_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
     ledcSetup(MOTOR2_IN1_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
     ledcSetup(MOTOR2_IN2_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
-    ledcSetup(MOTOR3_IN1_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
-    ledcSetup(MOTOR3_IN2_CHANNEL, PWM_FREQUENCY, PWM_RESOLUTION);
+    // 为电机3配置舵机PWM信号（50Hz，16位分辨率）
+    ledcSetup(MOTOR3_PWM_CHANNEL, SERVO_FREQ, SERVO_RESOLUTION);
+    
     
     // 将GPIO引脚连接到PWM通道
     ledcAttachPin(motor1_in1, MOTOR1_IN1_CHANNEL);
     ledcAttachPin(motor1_in2, MOTOR1_IN2_CHANNEL);
     ledcAttachPin(motor2_in1, MOTOR2_IN1_CHANNEL);
     ledcAttachPin(motor2_in2, MOTOR2_IN2_CHANNEL);
-    ledcAttachPin(motor3_in1, MOTOR3_IN1_CHANNEL);
-    ledcAttachPin(motor3_in2, MOTOR3_IN2_CHANNEL);
+    ledcAttachPin(motor3_in1, MOTOR3_PWM_CHANNEL);
+  
     
     // 初始化所有电机为停止状态
     stopMotor(1);
@@ -1699,22 +1767,24 @@ void setupWebServer() {
     
     // 传感器数据端点
     server.on("/sensorData", HTTP_GET, [](AsyncWebServerRequest *request) {
-        if (xSemaphoreTake(sensorDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            String json = "{\"temperature\":";
-            json += g_sensorData.temperature;
-            json += ",\"pressure\":";
-            json += g_sensorData.pressure;
-            json += ",\"rawAltitude\":";
-            json += g_sensorData.rawAltitude;
-            json += ",\"filteredAltitude\":";
-            json += g_sensorData.filteredAltitude;
-            json += "}";
-            xSemaphoreGive(sensorDataMutex);
-            request->send(200, "application/json", json);
-        } else {
-            request->send(503, "text/plain", "传感器数据暂时不可用");
-        }
-    });
+      if (xSemaphoreTake(sensorDataMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          String json = "{\"temperature\":";
+          json += g_sensorData.temperature;
+          json += ",\"pressure\":";
+          json += g_sensorData.pressure;
+          json += ",\"rawAltitude\":";
+          json += g_sensorData.rawAltitude;
+          json += ",\"filteredAltitude\":";
+          json += g_sensorData.filteredAltitude;
+          json += ",\"verticalSpeed\":";
+          json += g_sensorData.verticalSpeed;
+          json += "}";
+          xSemaphoreGive(sensorDataMutex);
+          request->send(200, "application/json", json);
+      } else {
+          request->send(503, "text/plain", "传感器数据暂时不可用");
+      }
+  });
     
     // PID控制相关端点
     // 获取高度控制状态，完整实现
@@ -1941,7 +2011,10 @@ void sensorTask(void *pvParameters) {
     // 本地变量
     int tempReadCounter = 0;
     float rawAltitude = 0;
-    
+    // 垂直速度计算相关变量
+    static float lastAltitude = 0;
+    static unsigned long lastVelocityTime = 0;
+    static float filteredSpeed = 0;
     // 任务循环
     while (1) {
         // 精确的周期控制
@@ -1971,6 +2044,25 @@ void sensorTask(void *pvParameters) {
                     filteredAlt = alpha * rawAltitude + (1 - alpha) * lastFilteredAlt;
                     lastFilteredAlt = filteredAlt;
                 }
+                // ====== 垂直速度计算开始 ======
+                unsigned long currentTime = millis();
+                if (lastVelocityTime > 0) {  // 不是第一次读取
+                    float deltaTime = (currentTime - lastVelocityTime) / 1000.0f;  // 转换为秒
+                    if (deltaTime > 0) {  // 防止除零错误
+                        float deltaAlt = filteredAlt - lastAltitude;  // 高度变化
+                        
+                        // 计算原始速度
+                        float rawSpeed = deltaAlt / deltaTime;  // m/s
+                        
+                        // 速度滤波 (使用比高度滤波更强的滤波效果)
+                        const float speedAlpha = 0.15;  // 速度滤波因子
+                        filteredSpeed = speedAlpha * rawSpeed + (1 - speedAlpha) * filteredSpeed;
+                    }
+                }
+                // 保存当前值作为下一次计算的基础
+                lastAltitude = filteredAlt;
+                lastVelocityTime = currentTime;
+                // ====== 垂直速度计算结束 ======
 
                 // 更新缓冲区状态以保持兼容性
                 altitudeBuffer[altitudeBufferIndex] = rawAltitude;
@@ -1987,6 +2079,7 @@ void sensorTask(void *pvParameters) {
                     g_sensorData.pressure = pressure;
                     g_sensorData.rawAltitude = rawAltitude;
                     g_sensorData.filteredAltitude = filteredAlt;
+                    g_sensorData.verticalSpeed = filteredSpeed;
                     g_sensorData.lastReadTime = millis();
                     xSemaphoreGive(sensorDataMutex);
                     
@@ -1996,13 +2089,13 @@ void sensorTask(void *pvParameters) {
                     // 调试输出(降低频率)
                     static uint32_t lastPrintTime = 0;
                     if (millis() - lastPrintTime > 500) {
-                        Serial.printf("高度: 原始=%.2f m, 滤波=%.2f m, 压力=%.2f hPa\n",
-                            rawAltitude, filteredAlt, pressure);
-                        lastPrintTime = millis();
-                    }
-                }
+                      Serial.printf("高度: 原始=%.2f m, 滤波=%.2f m, 速度=%.2f m/s, 压力=%.2f hPa\n",
+                          rawAltitude, filteredAlt, filteredSpeed, pressure);
+                      lastPrintTime = millis();
+                  }
             }
-        } else {
+        }
+      } else {
             // 偶尔读取温度
             tempReadCounter = 0;
             if (ms5611.read() == MS5611_READ_OK) {
@@ -2014,7 +2107,7 @@ void sensorTask(void *pvParameters) {
                     xSemaphoreGive(sensorDataMutex);
                 }
             }
-        }
+          }
     }
 }
 
