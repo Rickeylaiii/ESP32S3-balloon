@@ -1,19 +1,8 @@
-
-
-
-
-Uploading ac5e643d1247e4afe7a89d0a7b0b6c2a.mp4…
-
-
 https://github.com/user-attachments/assets/f849bf14-467e-49ee-abb1-8e11647cb779
-
-
 https://github.com/user-attachments/assets/3fcdc3fb-1d82-409b-9b4f-4b68670845e6
-
+https://github.com/user-attachments/assets/1066271c-06d5-412c-97a7-230d42da1632
 ![ecbe92497b6dbc72a2f50104f1cd107](https://github.com/user-attachments/assets/3677b218-2745-499a-a7e9-7753df2ffe9f)
 ![cfed1c70533ec250ce0434732a0a4cd](https://github.com/user-attachments/assets/9a5839c5-e7bd-46ee-b46f-0fc174a1b950)
-
-
 # MS5611
 Arduino library for MS5611 temperature and pressure sensor.
 ## Description
